@@ -53,12 +53,21 @@ HEADERS = [
 ]
 
 # ── Google Sheets ─────────────────────────────────────
-def get_sheets_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
+def get_credentials():
+    google_creds_json = os.environ.get("GOOGLE_CREDENTIALS", "")
+    if google_creds_json:
+        info = json.loads(google_creds_json)
+        return service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+    return service_account.Credentials.from_service_account_file(
+        os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json"),
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    return build("sheets", "v4", credentials=creds)
+
+def get_sheets_service():
+    return build("sheets", "v4", credentials=get_credentials())
 
 
 def ensure_sheets(service):
