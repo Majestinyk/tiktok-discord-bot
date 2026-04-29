@@ -7,6 +7,7 @@ import os
 import re
 import json
 import base64
+import asyncio
 import discord
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -41,6 +42,7 @@ SUMMARY_SHEET = os.environ.get("SUMMARY_SHEET", "合算")
 HEADERS = [
     "画像読み込み日時",
     "動画投稿日",
+    "動画タイトル",
     "編集者",
     "動画視聴数",
     "総再生時間",
@@ -219,10 +221,11 @@ async def extract_data(image_b64: str, media_type: str) -> dict:
     prompt = """この画像はTikTokの動画分析画面です。画像タイプを判定してJSONのみ返してください。
 
 【タイプ1: 統計サマリー画面（数値KPI一覧）】
-画面上部に「2026/3/15に投稿」のような投稿日が表示されています。正確に読み取ってください。
+画面上部に動画タイトルと「2026/3/15に投稿」のような投稿日が表示されています。正確に読み取ってください。
 {
   "type": "stats",
   "投稿日": "文字列（例: 2026/3/15）",
+  "動画タイトル": "文字列（例: 集まれ愛知県民#なかま #ジオゲッサー）",
   "動画視聴数": "数値文字列（例: 2600）",
   "総再生時間": "文字列（例: 14h:42m:9s）",
   "平均視聴時間": "文字列（例: 17.83s）",
@@ -242,7 +245,7 @@ async def extract_data(image_b64: str, media_type: str) -> dict:
 JSONのみ返してください。マークダウン・説明文は不要です。"""
 
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-sonnet-4-20250514",
         "max_tokens": 400,
         "messages": [{
             "role": "user",
@@ -253,16 +256,25 @@ JSONのみ返してください。マークダウン・説明文は不要です�
         }],
     }
 
-    async with httpx.AsyncClient(timeout=30) as http:
-        r = await http.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-        )
+    for attempt in range(3):
+        async with httpx.AsyncClient(timeout=60) as http:
+            r = await http.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            if r.status_code == 529:
+                wait = (attempt + 1) * 10
+                print(f"529エラー、{wait}秒後にリトライ ({attempt+1}/3)")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            break
+    else:
         r.raise_for_status()
 
     raw = r.json()["content"][0]["text"].strip()
@@ -335,6 +347,7 @@ async def on_message(message: discord.Message):
         row = [
             now_jst,
             stats.get("投稿日", ""),
+            stats.get("動画タイトル", ""),
             editor_name,
             stats.get("動画視聴数", ""),
             stats.get("総再生時間", ""),
