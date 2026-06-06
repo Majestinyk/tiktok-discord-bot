@@ -1,6 +1,6 @@
 """
-TikTok Analytics Discord Bot - 編集者別シート管理版
-@メンションで編集者を判別し、個別シート＋合算シートに追記するボット
+TikTok Analytics Discord Bot - 動的編集者管理版
+@メンションで編集者を自動判別・シートを自動作成するボット
 """
 
 import os
@@ -19,24 +19,19 @@ DISCORD_TOKEN        = os.environ.get("DISCORD_BOT_TOKEN", "")
 ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 TARGET_CHANNEL_ID    = int(os.environ.get("TARGET_CHANNEL_ID", "0"))
 SPREADSHEET_ID       = os.environ.get("SPREADSHEET_ID", "")
-SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
+SUMMARY_SHEET        = os.environ.get("SUMMARY_SHEET", "合算")
 
 JST = timezone(timedelta(hours=9))
 
-# ── 編集者設定 ────────────────────────────────────────
-EDITORS = {
-    "みゃも": {
-        "sheet": "みゃも",
-        "color": {"red": 0.18, "green": 0.62, "blue": 0.35},
-        "color_hex": "2E9E59",
-    },
-    "まぜし": {
-        "sheet": "まぜし",
-        "color": {"red": 0.45, "green": 0.18, "blue": 0.69},
-        "color_hex": "7330B0",
-    },
-}
-SUMMARY_SHEET = os.environ.get("SUMMARY_SHEET", "合算")
+# ── 色のローテーション（編集者が増えるたびに自動割り当て） ──
+COLORS = [
+    {"red": 0.18, "green": 0.62, "blue": 0.35},  # 緑
+    {"red": 0.45, "green": 0.18, "blue": 0.69},  # 紫
+    {"red": 0.20, "green": 0.45, "blue": 0.75},  # 青
+    {"red": 0.85, "green": 0.35, "blue": 0.15},  # オレンジ
+    {"red": 0.75, "green": 0.15, "blue": 0.35},  # ピンク
+    {"red": 0.15, "green": 0.60, "blue": 0.60},  # シアン
+]
 
 # ── ヘッダー ──────────────────────────────────────────
 HEADERS = [
@@ -72,55 +67,63 @@ def get_sheets_service():
     return build("sheets", "v4", credentials=get_credentials())
 
 
-def ensure_sheets(service):
+def get_existing_sheets(service) -> dict:
+    """既存シート名とIDの辞書を返す"""
     meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    existing = {s["properties"]["title"] for s in meta["sheets"]}
+    return {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
 
-    requests = []
+
+def ensure_summary_sheet(service):
+    """合算シートがなければ作成"""
+    existing = get_existing_sheets(service)
     if SUMMARY_SHEET not in existing:
-        requests.append({"addSheet": {"properties": {
-            "title": SUMMARY_SHEET,
-            "tabColor": {"red": 0.95, "green": 0.60, "blue": 0.07},
-        }}})
-    for name, cfg in EDITORS.items():
-        if cfg["sheet"] not in existing:
-            requests.append({"addSheet": {"properties": {
-                "title": cfg["sheet"],
-                "tabColor": cfg["color"],
-            }}})
-    if requests:
         service.spreadsheets().batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
-            body={"requests": requests},
+            body={"requests": [{"addSheet": {"properties": {
+                "title": SUMMARY_SHEET,
+                "tabColor": {"red": 0.95, "green": 0.60, "blue": 0.07},
+            }}}]},
         ).execute()
-
-    for sheet_name in [SUMMARY_SHEET] + [c["sheet"] for c in EDITORS.values()]:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{sheet_name}!A1:K1",
-        ).execute()
-        if not result.get("values"):
-            service.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"{sheet_name}!A1",
-                valueInputOption="RAW",
-                body={"values": [HEADERS]},
-            ).execute()
-            _style_header(service, sheet_name)
+        _write_header(service, SUMMARY_SHEET, {"red": 0.95, "green": 0.60, "blue": 0.07})
 
 
-def _style_header(service, sheet_name: str):
-    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    sheet_id = next(
-        s["properties"]["sheetId"]
-        for s in meta["sheets"]
-        if s["properties"]["title"] == sheet_name
-    )
-    if sheet_name == SUMMARY_SHEET:
-        bg = {"red": 0.95, "green": 0.60, "blue": 0.07}
-    else:
-        cfg = next((c for c in EDITORS.values() if c["sheet"] == sheet_name), None)
-        bg = cfg["color"] if cfg else {"red": 0.3, "green": 0.3, "blue": 0.3}
+def ensure_editor_sheet(service, editor_name: str) -> dict:
+    """編集者シートがなければ自動作成して色を割り当てる"""
+    existing = get_existing_sheets(service)
+
+    if editor_name in existing:
+        # 既存シートの色情報を返す（色インデックスで管理）
+        editor_count = len([k for k in existing if k not in [SUMMARY_SHEET]])
+        color = COLORS[(list(existing.keys()).index(editor_name) - 1) % len(COLORS)]
+        return {"color": color}
+
+    # 新規作成：既存の編集者シート数で色を決定
+    editor_sheets = [k for k in existing if k not in [SUMMARY_SHEET]]
+    color = COLORS[len(editor_sheets) % len(COLORS)]
+
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": [{"addSheet": {"properties": {
+            "title": editor_name,
+            "tabColor": color,
+        }}}]},
+    ).execute()
+    _write_header(service, editor_name, color)
+    print(f"✅ 新しい編集者シートを作成: {editor_name}")
+    return {"color": color}
+
+
+def _write_header(service, sheet_name: str, bg_color: dict):
+    """ヘッダー行を書いてスタイルを設定"""
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!A1",
+        valueInputOption="RAW",
+        body={"values": [HEADERS]},
+    ).execute()
+
+    existing = get_existing_sheets(service)
+    sheet_id = existing[sheet_name]
 
     service.spreadsheets().batchUpdate(
         spreadsheetId=SPREADSHEET_ID,
@@ -129,7 +132,7 @@ def _style_header(service, sheet_name: str):
                 "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
                 "cell": {
                     "userEnteredFormat": {
-                        "backgroundColor": bg,
+                        "backgroundColor": bg_color,
                         "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
                         "horizontalAlignment": "CENTER",
                     }
@@ -150,16 +153,14 @@ def append_row(service, sheet_name: str, row: list):
     ).execute()
 
 
-def color_editor_cell_in_summary(service, editor_cfg: dict):
-    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    sheet_id = next(
-        s["properties"]["sheetId"]
-        for s in meta["sheets"]
-        if s["properties"]["title"] == SUMMARY_SHEET
-    )
+def color_editor_cell_in_summary(service, editor_name: str, color: dict):
+    """合算シートの編集者列（D列）に色付きテキストを適用"""
+    existing = get_existing_sheets(service)
+    sheet_id = existing[SUMMARY_SHEET]
+
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SUMMARY_SHEET}!C:C",
+        range=f"{SUMMARY_SHEET}!D:D",
     ).execute()
     last_row = len(result.get("values", [])) - 1
 
@@ -171,14 +172,14 @@ def color_editor_cell_in_summary(service, editor_cfg: dict):
                     "sheetId": sheet_id,
                     "startRowIndex": last_row,
                     "endRowIndex": last_row + 1,
-                    "startColumnIndex": 2,  # C列（編集者）
-                    "endColumnIndex": 3,
+                    "startColumnIndex": 3,  # D列
+                    "endColumnIndex": 4,
                 },
                 "cell": {
                     "userEnteredFormat": {
                         "textFormat": {
                             "bold": True,
-                            "foregroundColor": editor_cfg["color"],
+                            "foregroundColor": color,
                         }
                     }
                 },
@@ -188,23 +189,14 @@ def color_editor_cell_in_summary(service, editor_cfg: dict):
     ).execute()
 
 
-# ── @メンションから編集者を判別 ──────────────────────
+# ── @メンションから編集者名を取得 ────────────────────
 def detect_editor(message: discord.Message):
-    for member in message.mentions:
-        display = (member.display_name or "").lower()
-        global_name = (member.global_name or "").lower()
-        nick = (member.name or "").lower()
-        for editor_name, cfg in EDITORS.items():
-            key = editor_name.lower()
-            if key in (display, global_name, nick):
-                return editor_name, cfg
-
-    text = message.content.lower()
-    for editor_name, cfg in EDITORS.items():
-        if f"@{editor_name.lower()}" in text:
-            return editor_name, cfg
-
-    return None, None
+    """メンションされたユーザーの表示名を返す"""
+    if message.mentions:
+        member = message.mentions[0]
+        name = member.display_name or member.global_name or member.name
+        return name
+    return None
 
 
 # ── 画像 → base64 ────────────────────────────────────
@@ -245,7 +237,7 @@ async def extract_data(image_b64: str, media_type: str) -> dict:
 JSONのみ返してください。マークダウン・説明文は不要です。"""
 
     payload = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": 400,
         "messages": [{
             "role": "user",
@@ -256,25 +248,16 @@ JSONのみ返してください。マークダウン・説明文は不要です�
         }],
     }
 
-    for attempt in range(3):
-        async with httpx.AsyncClient(timeout=60) as http:
-            r = await http.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json=payload,
-            )
-            if r.status_code == 529:
-                wait = (attempt + 1) * 10
-                print(f"529エラー、{wait}秒後にリトライ ({attempt+1}/3)")
-                await asyncio.sleep(wait)
-                continue
-            r.raise_for_status()
-            break
-    else:
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+        )
         r.raise_for_status()
 
     raw = r.json()["content"][0]["text"].strip()
@@ -293,11 +276,10 @@ async def on_ready():
     print(f"✅ ボット起動: {client.user}")
     print(f"   監視チャンネルID : {TARGET_CHANNEL_ID}")
     print(f"   スプレッドシートID: {SPREADSHEET_ID}")
-    print(f"   編集者設定: {list(EDITORS.keys())}")
     try:
         service = get_sheets_service()
-        ensure_sheets(service)
-        print("   シート初期化: OK")
+        ensure_summary_sheet(service)
+        print("   合算シート確認: OK")
     except Exception as e:
         print(f"   ⚠️ Sheets接続エラー: {e}")
 
@@ -313,11 +295,11 @@ async def on_message(message: discord.Message):
     if not images:
         return
 
-    editor_name, editor_cfg = detect_editor(message)
+    editor_name = detect_editor(message)
     if not editor_name:
         await message.reply(
             "⚠️ 編集者のメンションが見つかりませんでした。\n"
-            f"投稿時に `@みゃも` または `@まぜし` をメンションしてください。"
+            "投稿時に編集者を `@メンション` してください。"
         )
         return
 
@@ -341,8 +323,7 @@ async def on_message(message: discord.Message):
             await processing_msg.edit(content="❌ 画像の種類を正しく判別できませんでした。統計サマリー画面と視聴維持率グラフ画面の2枚を送ってください。")
             return
 
-        now_jst    = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-        posted_jst = message.created_at.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+        now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
         row = [
             now_jst,
@@ -360,19 +341,19 @@ async def on_message(message: discord.Message):
         ]
 
         service = get_sheets_service()
-        append_row(service, editor_cfg["sheet"], row)
+        editor_cfg = ensure_editor_sheet(service, editor_name)
+        append_row(service, editor_name, row)
         append_row(service, SUMMARY_SHEET, row)
-        color_editor_cell_in_summary(service, editor_cfg)
+        color_editor_cell_in_summary(service, editor_name, editor_cfg["color"])
 
         sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
-        color_emoji = "🟢" if editor_cfg["color_hex"] == "2E9E59" else "🟣"
         await processing_msg.edit(
             content=(
-                f"{color_emoji} **{editor_name}** のデータを記録しました！\n"
+                f"✅ **{editor_name}** のデータを記録しました！\n"
                 f"📊 動画視聴数: **{stats.get('動画視聴数')}**　"
                 f"フォロワー増: **{stats.get('新規フォロワー数')}**　"
                 f"視聴維持率: **{retention.get('視聴維持率')}**（{retention.get('時間')}地点）\n"
-                f"📝 記録先: `{editor_cfg['sheet']}` シート ＋ `{SUMMARY_SHEET}` シート\n"
+                f"📝 記録先: `{editor_name}` シート ＋ `{SUMMARY_SHEET}` シート\n"
                 f"🔗 {sheet_url}"
             )
         )
